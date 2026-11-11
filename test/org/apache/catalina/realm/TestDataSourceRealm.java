@@ -152,7 +152,113 @@ public class TestDataSourceRealm extends LoggingBaseTest {
         List<String> roles = db.getRoles("tomcat");
         Assert.assertEquals(2, roles.size());
 
-        db.stop();
+        p = db.getPrincipal("blabla");
+        Assert.assertNull(p);
 
+        p = db.getPrincipal("random");
+        Assert.assertTrue(p instanceof GenericPrincipal);
+        gp = (GenericPrincipal) p;
+        Assert.assertEquals(0, gp.getRoles().length);
+
+        db.stop();
+    }
+
+
+    @Test
+    public void testRoleLookupFailure() throws Exception {
+
+        Assume.assumeTrue(JreCompat.isJre16Available());
+
+        DerbyDataSourceRealm realm = new DerbyDataSourceRealm("dsRealmRoleLookupFailure");
+        realm.setUserTable("users");
+        realm.setUserNameCol("user_name");
+        realm.setUserCredCol("user_pass");
+        // The role table is never created so every role lookup fails
+        realm.setUserRoleTable("user_roles");
+        realm.setRoleNameCol("role_name");
+
+        // Only create the users table
+        Connection connection = realm.open();
+        try (Statement statement = connection.createStatement()) {
+            statement.execute(SIMPLE_SCHEMA.split(";")[0]);
+        }
+        try (PreparedStatement stmt = connection.prepareStatement(USERS_INSERT)) {
+            stmt.setString(1, "tomcat");
+            stmt.setString(2, "password");
+            stmt.executeUpdate();
+        }
+
+        realm.start();
+        try {
+            // Valid credentials but the role lookup fails so authentication must fail
+            Assert.assertNull(realm.authenticate("tomcat", "password"));
+            Assert.assertNull(realm.authenticate("tomcat"));
+            Assert.assertNull(realm.getPrincipal("tomcat"));
+            Assert.assertNull(realm.getRoles("tomcat"));
+        } finally {
+            realm.stop();
+        }
+    }
+
+
+    @Test
+    public void testAuthenticationOnly() throws Exception {
+
+        Assume.assumeTrue(JreCompat.isJre16Available());
+
+        DerbyDataSourceRealm realm = new DerbyDataSourceRealm("dsRealmAuthOnly");
+        realm.setUserTable("users");
+        realm.setUserNameCol("user_name");
+        realm.setUserCredCol("user_pass");
+        // No role store is configured
+        realm.setAllRolesMode("authOnly");
+
+        Connection connection = realm.open();
+        try (Statement statement = connection.createStatement()) {
+            statement.execute(SIMPLE_SCHEMA.split(";")[0]);
+        }
+        try (PreparedStatement stmt = connection.prepareStatement(USERS_INSERT)) {
+            stmt.setString(1, "tomcat");
+            stmt.setString(2, "password");
+            stmt.executeUpdate();
+        }
+
+        realm.start();
+        try {
+            Assert.assertNull(realm.authenticate("tomcat", "bar"));
+            Assert.assertNull(realm.authenticate("blabla", "password"));
+            Assert.assertNull(realm.authenticate("blabla"));
+
+            Principal p = realm.authenticate("tomcat", "password");
+            Assert.assertTrue(p instanceof GenericPrincipal);
+            Assert.assertEquals(0, ((GenericPrincipal) p).getRoles().length);
+
+            p = realm.authenticate("tomcat");
+            Assert.assertTrue(p instanceof GenericPrincipal);
+            Assert.assertEquals(0, ((GenericPrincipal) p).getRoles().length);
+        } finally {
+            realm.stop();
+        }
+    }
+
+
+    @Test
+    public void testDatabaseUnavailable() throws Exception {
+
+        DataSourceRealm realm = new DataSourceRealm() {
+            {
+                containerLog = log;
+            }
+            @Override
+            protected Connection open() {
+                // Simulate the database being unavailable
+                return null;
+            }
+        };
+
+        Assert.assertNull(realm.authenticate("tomcat", "password"));
+        // Username only authentication (e.g. CLIENT-CERT, SPNEGO) must fail
+        Assert.assertNull(realm.authenticate("tomcat"));
+        Assert.assertNull(realm.getPrincipal("tomcat"));
     }
 }
