@@ -13,12 +13,12 @@
 name: Smoke Test
 
 on:
-  push:
-    branches:
-      - 10.1.x
-  pull_request:
-    branches:
-      - 10.1.x
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional comma-separated test classes (TestFoo or org/apache/x/TestFoo.java); empty runs the full suite'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -37,6 +37,7 @@ jobs:
         os: [ ubuntu-latest ]
     name: JDK${{ matrix.java }} ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
     steps:
     - name: Git Checkout
       uses: actions/checkout@v4
@@ -45,17 +46,180 @@ jobs:
       with:
         java-version: ${{ matrix.java }}
         distribution: zulu
+    # Seal Security: tomcat-native 2.0.15 (the version build.properties.default
+    # pins) so the JNI OpenSSL test variants run instead of skipping.
+    - name: Build tomcat-native 2.0.15
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends libapr1-dev libssl-dev
+        v=2.0.15
+        cd "$RUNNER_TEMP"
+        curl -fsSL -o tcnative.tar.gz "https://archive.apache.org/dist/tomcat/tomcat-connectors/native/$v/source/tomcat-native-$v-src.tar.gz"
+        echo "a0b53890c36c3409e764895cfc521cdbbc49af4d03968f5d3ed72ba686524a05bd15c3f7ab8259fbab091547ecbc2fb7aae8f47d8bc38027db0f6a5dbda65004  tcnative.tar.gz" | sha512sum -c -
+        tar xzf tcnative.tar.gz
+        cd "tomcat-native-$v-src/native"
+        ./configure --with-apr=/usr/bin/apr-1-config --with-ssl=/usr --with-java-home="$JAVA_HOME" --prefix="$RUNNER_TEMP/tcnative"
+        make -j4
+        make install
+        echo "LD_LIBRARY_PATH=$RUNNER_TEMP/tcnative/lib" >> "$GITHUB_ENV"
     - name: Build
       run: |
-        ant -noinput echoproperties deploy embed test-nio test-status
+        if [ -n "${{ inputs.test-filter }}" ]; then
+          echo "test-filter is set: smoke profile not run here; the selected tests run in the Full test suite job"
+          ant -noinput echoproperties deploy embed
+        else
+          ant -noinput echoproperties deploy embed test-nio test-status
+        fi
       env:
         ANT_OPTS: -Dtest.openssl.exists=false -Dtest.excludePerformance=true -Dtest.profile=smoke
+
+    - name: Test summary
+      if: ${{ !cancelled() && inputs.test-filter == '' }}
+      run: bash .github/seal-test-summary.sh output/build/logs
 
     - name: Upload logs
       if: ${{ !cancelled() }}
       uses: actions/upload-artifact@v4
       with:
         name: JDK${{ matrix.java }}-${{ matrix.os }}-logs
+        path: |
+          hs_err_*.log
+          output/build/logs/TEST*.txt
+        retention-days: 7
+
+  # Seal Security: the smoke job above runs a test profile only and uploads no
+  # jar. Release_Jar builds the shipped tomcat-embed-core jar on JDK 21
+  # (release.java.version=22 gates the FFM/panama classes, which the public
+  # 10.1.56 jar does not contain) and uploads it.
+  Release_Jar:
+    name: Release jar (JDK 21)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Git Checkout
+      uses: actions/checkout@v4
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: temurin
+    - name: Build embedded jars
+      run: |
+        ant -version
+        ant -noinput embed-jars
+        mkdir -p seal-dist
+        cp output/embed/tomcat-embed-core.jar seal-dist/tomcat-embed-core-10.1.56.jar
+        unzip -l seal-dist/tomcat-embed-core-10.1.56.jar | tail -n 1
+        md5sum seal-dist/tomcat-embed-core-10.1.56.jar
+    - name: Upload jar
+      uses: actions/upload-artifact@v4
+      with:
+        name: tomcat-embed-core-jar
+        path: seal-dist/tomcat-embed-core-10.1.56.jar
+        if-no-files-found: error
+        retention-days: 7
+
+  # Seal Security: full test suite (not only the smoke profile) for every
+  # package shipped in tomcat-embed-core, on both NIO and NIO2 connectors, with
+  # tomcat-native 2.0.15 built against OpenSSL 3.5.7 (the versions
+  # build.properties.default pins) so the OpenSSL/JNI and PQC tests run.
+  Full_Tests:
+    name: Full suite JDK21 NIO+NIO2 (${{ matrix.leg }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: catalina
+            tests: 'org/apache/catalina/**/Test*.java'
+          - leg: coyote
+            tests: 'org/apache/coyote/**/Test*.java'
+          - leg: tomcat
+            tests: 'org/apache/tomcat/**/Test*.java'
+          - leg: servlet-juli-naming
+            tests: 'jakarta/**/Test*.java,org/apache/juli/**/Test*.java,org/apache/naming/**/Test*.java'
+          - leg: performance
+            tests: 'jakarta/**/Test*Performance.java,org/apache/catalina/**/Test*Performance.java,org/apache/coyote/**/Test*Performance.java,org/apache/tomcat/**/Test*Performance.java,org/apache/juli/**/Test*Performance.java,org/apache/naming/**/Test*Performance.java'
+    steps:
+    - name: Git Checkout
+      uses: actions/checkout@v4
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: temurin
+    # OpenSSL 3.5.7 = tomcat-native-openssl.version in build.properties.default.
+    # The runner ships OpenSSL 3.0, on which the TestPQC (ML-DSA / ML-KEM)
+    # cases skip with "PQC requires OpenSSL 3.5+".
+    - name: Build OpenSSL 3.5.7
+      run: |
+        v=3.5.7
+        cd "$RUNNER_TEMP"
+        curl -fsSL -o openssl.tar.gz "https://github.com/openssl/openssl/releases/download/openssl-$v/openssl-$v.tar.gz"
+        echo "a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8  openssl.tar.gz" | sha256sum -c -
+        tar xzf openssl.tar.gz
+        cd "openssl-$v"
+        ./Configure --prefix="$RUNNER_TEMP/openssl" --libdir=lib shared no-tests no-docs
+        make -j4 > "$RUNNER_TEMP/openssl-make.log" 2>&1 || { tail -n 100 "$RUNNER_TEMP/openssl-make.log"; exit 1; }
+        make install_sw > /dev/null
+        echo "LD_LIBRARY_PATH=$RUNNER_TEMP/openssl/lib:$RUNNER_TEMP/tcnative/lib" >> "$GITHUB_ENV"
+        LD_LIBRARY_PATH="$RUNNER_TEMP/openssl/lib" "$RUNNER_TEMP/openssl/bin/openssl" version
+    - name: Build tomcat-native 2.0.15
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends libapr1-dev
+        v=2.0.15
+        cd "$RUNNER_TEMP"
+        curl -fsSL -o tcnative.tar.gz "https://archive.apache.org/dist/tomcat/tomcat-connectors/native/$v/source/tomcat-native-$v-src.tar.gz"
+        echo "a0b53890c36c3409e764895cfc521cdbbc49af4d03968f5d3ed72ba686524a05bd15c3f7ab8259fbab091547ecbc2fb7aae8f47d8bc38027db0f6a5dbda65004  tcnative.tar.gz" | sha512sum -c -
+        tar xzf tcnative.tar.gz
+        cd "tomcat-native-$v-src/native"
+        ./configure --with-apr=/usr/bin/apr-1-config --with-ssl="$RUNNER_TEMP/openssl" --with-java-home="$JAVA_HOME" --prefix="$RUNNER_TEMP/tcnative"
+        make -j4
+        make install
+        ls -l "$RUNNER_TEMP/tcnative/lib"
+        ldd "$RUNNER_TEMP/tcnative/lib/libtcnative-2.so" | grep -E "ssl|crypto"
+    - name: Test
+      run: |
+        filter="${{ inputs.test-filter }}"
+        leg="${{ matrix.leg }}"
+        threads=4
+        perf=true
+        names='${{ matrix.tests }}'
+        if [ -n "$filter" ]; then
+          if [ "$leg" != catalina ]; then
+            echo "test-filter is set: the selected tests run in the catalina leg only"
+            exit 0
+          fi
+          names=""
+          IFS=',' read -ra toks <<< "$filter"
+          for t in "${toks[@]}"; do
+            case "$t" in */*) p="$t" ;; *) p="**/$t" ;; esac
+            case "$p" in *.java) ;; *) p="$p.java" ;; esac
+            names="${names:+$names,}$p"
+          done
+          perf=false
+        elif [ "$leg" = performance ]; then
+          threads=1
+          perf=false
+        fi
+        echo "Running test.name=$names threads=$threads excludePerformance=$perf"
+        ant -noinput test-nio test-nio2 \
+          -Dtest.threads=$threads -Dtest.verbose=false \
+          -Dtest.excludePerformance=$perf \
+          -Dtest.apr.loc="$RUNNER_TEMP/tcnative/lib" \
+          -Dtest.openssl.path="$RUNNER_TEMP/openssl/bin/openssl" \
+          -Dtest.name="$names" \
+          test-status
+    - name: Test summary
+      if: ${{ !cancelled() && (inputs.test-filter == '' || matrix.leg == 'catalina') }}
+      run: bash .github/seal-test-summary.sh output/build/logs
+    - name: Upload logs
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: full-tests-${{ matrix.leg }}-logs
         path: |
           hs_err_*.log
           output/build/logs/TEST*.txt
