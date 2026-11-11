@@ -25,6 +25,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import jakarta.servlet.ServletContext;
 import jakarta.servlet.ServletException;
@@ -666,6 +667,80 @@ public class TestAbstractAjpProcessor extends TomcatBaseTest {
             validateResponseEnd(ajpClient.readMessage(), false);
         }
 
+
+        ajpClient.disconnect();
+    }
+
+
+    @Test
+    public void testErrorWithUnsentBodyInvalidSecret() throws Exception {
+        doTestErrorWithUnsentBody(false, HttpServletResponse.SC_FORBIDDEN, "403");
+    }
+
+
+    @Test
+    public void testErrorWithUnsentBodyMultipleContentLength() throws Exception {
+        doTestErrorWithUnsentBody(true, HttpServletResponse.SC_BAD_REQUEST, "400");
+    }
+
+
+    /*
+     * When the request is in an error state the connection is going to be closed so the unread request body must not
+     * be swallowed. Swallowing it would block the processing thread until the connection timeout expires waiting for a
+     * body packet the client never sends.
+     */
+    private void doTestErrorWithUnsentBody(boolean multipleCL, int expectedStatus, String expectedMessage)
+            throws Exception {
+
+        int connectionTimeout = 10000;
+
+        Tomcat tomcat = getTomcatInstance();
+        Assert.assertTrue(
+                tomcat.getConnector().setProperty("connectionTimeout", Integer.toString(connectionTimeout)));
+        if (!multipleCL) {
+            Assert.assertTrue(tomcat.getConnector().setProperty("secret", "RIGHTSECRET"));
+        }
+
+        // No file system docBase required
+        Context ctx = getProgrammaticRootContext();
+
+        Tomcat.addServlet(ctx, "helloWorld", new HelloWorldServlet());
+        ctx.addServletMappingDecoded("/", "helloWorld");
+
+        tomcat.start();
+
+        SimpleAjpClient ajpClient = new SimpleAjpClient();
+        ajpClient.setPort(getPort());
+        ajpClient.connect();
+
+        validateCpong(ajpClient.cping());
+
+        ajpClient.setMethod(Method.POST);
+        TesterAjpMessage forwardMessage = ajpClient.createForwardMessage();
+        // Announce a request body that is never sent
+        forwardMessage.addHeader(0xA008, "10");
+        if (multipleCL) {
+            forwardMessage.addHeader(0xA008, "99");
+        } else {
+            forwardMessage.addAttribute(0x0C, "WRONGSECRET");
+        }
+        forwardMessage.end();
+
+        long start = System.nanoTime();
+
+        // Only the forward message is sent - no body message follows
+        TesterAjpMessage responseHeaders = ajpClient.sendMessage(forwardMessage, null);
+
+        // Expect 3 messages: headers, error report body, end (with the connection closed)
+        validateResponseHeaders(responseHeaders, expectedStatus, expectedMessage);
+        StringManager smClient = StringManager.getManager("org.apache.catalina.valves");
+        String expectedBody = "<p><b>" + smClient.getString("errorReportValve.type") + "</b> " +
+                smClient.getString("errorReportValve.statusReport") + "</p>";
+        validateResponseBody(ajpClient.readMessage(), expectedBody);
+        validateResponseEnd(ajpClient.readMessage(), false);
+
+        long durationMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+        Assert.assertTrue("Response took [" + durationMillis + "] ms", durationMillis < connectionTimeout);
 
         ajpClient.disconnect();
     }
