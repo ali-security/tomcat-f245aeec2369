@@ -38,9 +38,11 @@ import org.apache.catalina.Wrapper;
 import org.apache.catalina.connector.Connector;
 import org.apache.catalina.connector.ResponseFacade;
 import org.apache.catalina.startup.Tomcat;
+import org.apache.coyote.http11.AbstractHttp11Protocol;
 import org.apache.tomcat.util.compat.JrePlatform;
 import org.apache.tomcat.util.http.FastHttpDateFormat;
 import org.apache.tomcat.util.http.Method;
+import org.apache.tomcat.util.http.MimeHeaders;
 
 public class TestStreamProcessor extends Http2TestBase {
 
@@ -431,6 +433,82 @@ public class TestStreamProcessor extends Http2TestBase {
 
         // The status code is the most important thing to test
         Assert.assertTrue(output.getTrace().startsWith(expected.toString()));
+    }
+
+
+    /*
+     * The bad request note is a per request note but notes are not cleared when the request is recycled. If the note
+     * is set after the request has been validated (e.g. by an invalid host header received as a trailer) it must not
+     * leak into the next request that re-uses the pooled request object.
+     */
+    @Test
+    public void testBadRequestNoteClearedOnRecycle() throws Exception {
+        http2Connect();
+
+        // Allow host to be sent as a trailer header so it is processed after the request has been validated
+        ((AbstractHttp11Protocol<?>) http2Protocol.getHttp11Protocol()).setAllowedTrailerHeaders("host");
+
+        // Disable overhead protection for window update as it breaks some tests
+        http2Protocol.setOverheadWindowUpdateThreshold(0);
+
+        byte[] headersFrameHeader = new byte[9];
+        ByteBuffer headersPayload = ByteBuffer.allocate(128);
+        byte[] dataFrameHeader = new byte[9];
+        ByteBuffer dataPayload = ByteBuffer.allocate(256);
+
+        // POST with a valid :authority and a request body but without end of stream
+        buildPostRequest(headersFrameHeader, headersPayload, false, dataFrameHeader, dataPayload, null, true, 3);
+        writeFrame(headersFrameHeader, headersPayload);
+        writeFrame(dataFrameHeader, dataPayload);
+
+        // Trailers with an invalid host header. This sets the bad request note on the request.
+        byte[] trailerFrameHeader = new byte[9];
+        ByteBuffer trailerPayload = ByteBuffer.allocate(128);
+        MimeHeaders trailerHeaders = new MimeHeaders();
+        trailerHeaders.addValue("host").setString("local!host:" + getPort());
+        hpackEncoder.encode(trailerHeaders, trailerPayload);
+        trailerPayload.flip();
+        ByteUtil.setThreeBytes(trailerFrameHeader, 0, trailerPayload.limit());
+        trailerFrameHeader[3] = FrameType.HEADERS.getIdByte();
+        // Flags. end of headers (0x04) and end of stream (0x01)
+        trailerFrameHeader[4] = 0x05;
+        ByteUtil.set31Bits(trailerFrameHeader, 5, 3);
+        writeFrame(trailerFrameHeader, trailerPayload);
+
+        // Read the response to the POST request
+        int count = 0;
+        while (!output.getTrace().contains("3-EndOfStream") && count < 20) {
+            parser.readFrame();
+            count++;
+        }
+        String trace = output.getTrace();
+        Assert.assertTrue(trace, trace.contains("3-Header-[:status]-[200]"));
+        Assert.assertTrue(trace, trace.contains("3-EndOfStream"));
+
+        // Wait for stream 3 to be recycled (the request count is updated when the StreamProcessor is recycled) so the
+        // request object is returned to the pool and re-used for the next stream. Request 1 is the upgrade request.
+        count = 0;
+        while (http2Protocol.getGlobal().getRequestCount() < 2 && count < 100) {
+            Thread.sleep(50);
+            count++;
+        }
+        Assert.assertEquals(2, http2Protocol.getGlobal().getRequestCount());
+        // Allow the recycled request to be returned to the pool
+        Thread.sleep(100);
+
+        output.clearTrace();
+
+        // A valid request that re-uses the pooled request object must not be rejected
+        sendSimpleGetRequest(5);
+
+        count = 0;
+        while (!output.getTrace().contains("5-HeadersEnd") && count < 20) {
+            parser.readFrame();
+            count++;
+        }
+
+        trace = output.getTrace();
+        Assert.assertTrue(trace, trace.contains("5-Header-[:status]-[200]"));
     }
 
 
